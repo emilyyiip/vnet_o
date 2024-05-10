@@ -148,7 +148,6 @@ class VNet(nn.Module):
         for decoder, skip in zip(self.decoders, reversed(skips)):
             x, _ = decoder(x)  # Ignore pooling in decoder
             x = F.interpolate(x, size=skip.size()[2:], mode='trilinear', align_corners=False)
-            x = torch.cat([x, skip], dim=1)  # Concatenate features from encoder
 
         x = self.final_conv(x)
         return torch.sigmoid(x)  # Assuming binary classification
@@ -158,25 +157,64 @@ model = VNet()
 print(model)
 
 dataset = NiftiDataset(image_paths, mask_paths)
-loader = DataLoader(dataset, batch_size=1, shuffle=True)
+train_loader = DataLoader(dataset, batch_size=1, shuffle=True)
 
-# Setup the optimizer and loss function
+# Set up the optimizer, loss function, and model
 optimizer = optim.Adam(model.parameters(), lr=0.001)
 criterion = nn.BCELoss()
 
-# Move model to GPU if available
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = model.to(device)
+# Device configuration
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model.to(device)
 
-num_epochs = 10
+def dice_coefficient(pred, target):
+    smooth = 1.
+    num = pred.size(0)
+    m1 = pred.view(num, -1)  # Flatten
+    m2 = target.view(num, -1)  # Flatten
+    intersection = (m1 * m2).sum()
+
+    return (2. * intersection + smooth) / (m1.sum() + m2.sum() + smooth)
+
+best_dice = 0
+
 # Training loop
+num_epochs = 10
 for epoch in range(num_epochs):
-    for images, masks in loader:
-        images, masks = images.to(device), masks.to(device)
-        optimizer.zero_grad()
+    model.train()
+    running_loss = 0.0
+    for images, masks in train_loader:
+        images = images.to(device)
+        masks = masks.to(device)
+
+        # Forward pass
         outputs = model(images)
         loss = criterion(outputs, masks)
+
+        # Backward and optimize
+        optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         
-    print(f'Epoch {epoch+1}, Loss: {loss.item()}')
+        running_loss += loss.item()
+
+    # Evaluation and checkpoint saving
+    model.eval()
+    with torch.no_grad():
+        dice_scores = []
+        for images, masks in train_loader:
+            images = images.to(device)
+            masks = masks.to(device)
+            outputs = model(images)
+            preds = (outputs > 0.5).float()
+            dice_scores.append(dice_coefficient(preds, masks).item())
+
+        average_dice = np.mean(dice_scores)
+        if average_dice > best_dice:
+            best_dice = average_dice
+            torch.save(model.state_dict(), 'best_model.pth')
+            print(f'Saved Best Model with Dice Coefficient: {best_dice}')
+
+    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss / len(train_loader)}')
+
+print("Training complete.")
