@@ -9,14 +9,20 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset
+import matplotlib.pyplot as plt
 
-image_directory = '/Users/emilyyip/Desktop/MRI/Anatomical_mag_echo5/img/'
+image_directory = '/Users/emilyyip/Desktop/MRI/Anatomical_mag_echo5/'
 mask_directory = '/Users/emilyyip/Desktop/MRI/whole_liver_segmentation/'
+output_path = '/Users/emilyyip/Desktop/MRI/output.txt'
+save_dir = '/Users/emilyyip/Desktop/MRI/preds/'
+pred_dir = os.path.join(save_dir, 'predictions')
+img_dir = os.path.join(save_dir, 'images')
 
 def get_file_paths(image_directory, mask_directory):
     image_paths = [os.path.join(image_directory, filename) for filename in os.listdir(image_directory) if filename.endswith('.nii')]
     mask_paths = [os.path.join(mask_directory, filename) for filename in os.listdir(mask_directory) if filename.endswith('.nii')]
-    return image_paths, mask_paths
+    divide = len(image_paths) //5
+    return image_paths [:divide],mask_paths[:divide]
 
 image_paths, mask_paths = get_file_paths(image_directory, mask_directory)
 
@@ -155,19 +161,24 @@ class VNet(nn.Module):
 # Model instantiation
 model = VNet()
 print(model)
-
 dataset = NiftiDataset(image_paths, mask_paths)
-train_loader = DataLoader(dataset, batch_size=1, shuffle=True)
-
-# Set up the optimizer, loss function, and model
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-criterion = nn.BCELoss()
+dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
 
 # Device configuration
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 model.to(device)
 
-def dice_coefficient(pred, target):
+# Optimizer and loss function
+optimizer = optim.Adam(model.parameters(), lr=0.001)
+criterion = nn.BCEWithLogitsLoss()
+
+# Helper function to calculate Dice Coefficient
+# Ensure directories exist
+os.makedirs(pred_dir, exist_ok=True)
+os.makedirs(img_dir, exist_ok=True)
+
+# Dice Coefficient, TPR, and FPR Functions
+def dice_coef(pred, target):
     smooth = 1.
     num = pred.size(0)
     m1 = pred.view(num, -1)  # Flatten
@@ -176,45 +187,54 @@ def dice_coefficient(pred, target):
 
     return (2. * intersection + smooth) / (m1.sum() + m2.sum() + smooth)
 
-best_dice = 0
+def tprf(y_true, y_pred, threshold=0.5):
+    tp = ((y_pred >= threshold) & (y_true == 1)).float().sum().item()
+    fn = ((y_pred < threshold) & (y_true == 1)).float().sum().item()
+    return tp / (tp + fn) if (tp + fn) > 0 else -1
 
-# Training loop
-num_epochs = 10
+def fprf(y_true, y_pred, threshold=0.5):
+    fp = ((y_pred >= threshold) & (y_true == 0)).float().sum().item()
+    tn = ((y_pred < threshold) & (y_true == 0)).float().sum().item()
+    return fp / (fp + tn) if (fp + tn) > 0 else -1
+
+# Training and evaluation loop
+num_epochs = 5
 for epoch in range(num_epochs):
     model.train()
-    running_loss = 0.0
-    for images, masks in train_loader:
-        images = images.to(device)
-        masks = masks.to(device)
-
-        # Forward pass
+    for images, masks in dataloader:
+        images, masks = images.to(device), masks.to(device)
+        print("hi")
         outputs = model(images)
+        preds = (outputs > 0.5).float()
         loss = criterion(outputs, masks)
-
-        # Backward and optimize
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
-        running_loss += loss.item()
-
-    # Evaluation and checkpoint saving
+        print("train")
+    #TPRs = []
+    #FPRs = []
     model.eval()
     with torch.no_grad():
         dice_scores = []
-        for images, masks in train_loader:
+        for images, masks in dataloader:
             images = images.to(device)
             masks = masks.to(device)
             outputs = model(images)
             preds = (outputs > 0.5).float()
-            dice_scores.append(dice_coefficient(preds, masks).item())
+            dice_scores.append(dice_coef(preds, masks).item())
 
-        average_dice = np.mean(dice_scores)
-        if average_dice > best_dice:
-            best_dice = average_dice
-            torch.save(model.state_dict(), 'best_model.pth')
-            print(f'Saved Best Model with Dice Coefficient: {best_dice}')
+    # Calculate average scores
+    avg_dice = np.mean(dice_scores)
+    #avg_tpr = np.mean(TPRs)
+    #avg_fpr = np.mean(FPRs)
+    print(f'Average Dice: {avg_dice:.4f}')
+          
+ #TPR: {avg_tpr:.4f}, FPR: {avg_fpr:.4f}'
 
-    print(f'Epoch [{epoch+1}/{num_epochs}], Loss: {running_loss / len(train_loader)}')
+    with open(output_path, "a") as f:
+        print(f'Epoch {epoch + 1} Results:', file=f)
+        print(f'Average Dice Score: {avg_dice:.4f}', file=f)
+        #print(f'Average TPR: {avg_tpr:.4f}', file=f)
+        #print(f'Average FPR: {avg_fpr:.4f}', file=f)
 
 print("Training complete.")
