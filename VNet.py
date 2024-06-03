@@ -2,7 +2,7 @@ import torch
 from torch.utils.data import Dataset
 import numpy as np
 import nibabel as nib
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, random_split, Subset
 import os
 import torch
 import torch.nn as nn
@@ -10,22 +10,38 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset
 import matplotlib.pyplot as plt
+from sklearn.model_selection import KFold
 
 image_directory = '/Users/emilyyip/Desktop/MRI/Anatomical_mag_echo5/'
 mask_directory = '/Users/emilyyip/Desktop/MRI/whole_liver_segmentation/'
-output_path = '/Users/emilyyip/Desktop/MRI/output.txt'
-save_dir = '/Users/emilyyip/Desktop/MRI/preds/'
+output_path = '/Users/emilyyip/Desktop/MRI/preds/output.txt'
+save_dir = '/Users/emilyyip/Desktop/preds/'
 pred_dir = os.path.join(save_dir, 'predictions')
 img_dir = os.path.join(save_dir, 'images')
+from skimage.transform import resize
 
 def get_file_paths(image_directory, mask_directory):
     image_paths = [os.path.join(image_directory, filename) for filename in os.listdir(image_directory) if filename.endswith('.nii')]
     mask_paths = [os.path.join(mask_directory, filename) for filename in os.listdir(mask_directory) if filename.endswith('.nii')]
-    divide = len(image_paths) //5
-    return image_paths [:divide],mask_paths[:divide]
+    return image_paths, mask_paths
 
 image_paths, mask_paths = get_file_paths(image_directory, mask_directory)
 
+import cv2
+def resize_image(image, target_dims):
+    rows, cols = image.shape[:2]
+    target_rows, target_cols = target_dims
+
+    pad_vert = target_rows - rows
+    pad_top = pad_vert // 2
+    pad_bot = pad_vert - pad_top
+
+    pad_horz = target_cols - cols
+    pad_left = pad_horz // 2
+    pad_right = pad_horz - pad_left
+
+    img_padded = cv2.copyMakeBorder(image, pad_top, pad_bot, pad_left, pad_right, cv2.BORDER_CONSTANT)
+    return img_padded
 
 class NiftiDataset(Dataset):
     def __init__(self, image_files, mask_files):
@@ -36,16 +52,21 @@ class NiftiDataset(Dataset):
         return len(self.image_files)
 
     def __getitem__(self, idx):
-        # Load image and mask using nibabel
         image = nib.load(self.image_files[idx]).get_fdata()
         mask = nib.load(self.mask_files[idx]).get_fdata()
 
-        # Pad depth to 40 if not already
+        image = resize_image(image, (256,256))
+        mask = resize_image(mask, (256,256)) 
+
+        image = resize(image, (64,64))
+        mask = resize(mask, (64,64))
+
+        # pad depth
         if image.shape[2] != 40:
             image = self.pad_to_depth(image, 40)
             mask = self.pad_to_depth(mask, 40)
 
-        # Convert numpy arrays to PyTorch tensors with dtype float32
+        # convert arrays to pytorch tensors
         image_tensor = torch.tensor(image, dtype=torch.float32).unsqueeze(0)  # Add channel dimension
         mask_tensor = torch.tensor(mask, dtype=torch.float32).unsqueeze(0)    # Add channel dimension
 
@@ -90,7 +111,7 @@ class ConvBlock(nn.Module):
 
         if self.res_connect:
             identity = self.residual(identity)
-            x += identity  # Element-wise addition for residual connection
+            x += identity 
         
         return x
 
@@ -115,8 +136,6 @@ class DecoderBlock(nn.Module):
         x = self.up(x)
         # Ensure that the upsampled x has the same dimensions as skip before concatenating
         if x.size() != skip.size():
-            # Optionally add a print statement here to debug sizes
-            # print("Adjusting size from", x.size(), "to", skip.size())
             x = F.interpolate(x, size=skip.size()[2:], mode='trilinear', align_corners=True)
         x = torch.cat([x, skip], dim=1)
         x = self.conv(x)
@@ -125,8 +144,8 @@ class DecoderBlock(nn.Module):
 class VNet(nn.Module):
     def __init__(self):
         super(VNet, self).__init__()
-        # Adjust the filters to start with 1 if the input images are single-channel
-        filters = [1, 64, 128, 256, 256]  # Starting with 1 channel now
+        #filters
+        filters = [1, 64, 128, 256, 256]  
         self.encoders = nn.ModuleList([
             EncoderBlock(filters[i], filters[i+1], dropout=0.1, res_connect=True)
             for i in range(len(filters)-1)
@@ -156,36 +175,32 @@ class VNet(nn.Module):
             x = F.interpolate(x, size=skip.size()[2:], mode='trilinear', align_corners=False)
 
         x = self.final_conv(x)
-        return torch.sigmoid(x)  # Assuming binary classification
+        return torch.sigmoid(x)  # binary classification
 
-# Model instantiation
+kf = KFold(n_splits=3, shuffle=True, random_state=123)
+# make model
 model = VNet()
 print(model)
+batch_size = 1
+
 dataset = NiftiDataset(image_paths, mask_paths)
-dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+# Assuming you have already created 'dataset' as an instance of NiftiDataset
+total_size = len(dataset)
+train_size = int(0.8 * total_size)
+test_size = total_size - train_size
 
-# Device configuration
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-model.to(device)
+train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
 
-# Optimizer and loss function
-optimizer = optim.Adam(model.parameters(), lr=0.001)
-criterion = nn.BCEWithLogitsLoss()
-
-# Helper function to calculate Dice Coefficient
-# Ensure directories exist
-os.makedirs(pred_dir, exist_ok=True)
-os.makedirs(img_dir, exist_ok=True)
+# Create data loaders for both train and test datasets
+train_loader = DataLoader(train_dataset, batch_size=1, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=1, shuffle=False)
 
 # Dice Coefficient, TPR, and FPR Functions
-def dice_coef(pred, target):
-    smooth = 1.
-    num = pred.size(0)
-    m1 = pred.view(num, -1)  # Flatten
-    m2 = target.view(num, -1)  # Flatten
-    intersection = (m1 * m2).sum()
-
-    return (2. * intersection + smooth) / (m1.sum() + m2.sum() + smooth)
+def dice_coef(y_true, y_pred, smooth=1.):
+    y_true_f = y_true.contiguous().view(-1)
+    y_pred_f = y_pred.contiguous().view(-1)
+    intersection = (y_true_f * y_pred_f).sum()
+    return (2. * intersection + smooth) / (y_true_f.sum() + y_pred_f.sum() + smooth)
 
 def tprf(y_true, y_pred, threshold=0.5):
     tp = ((y_pred >= threshold) & (y_true == 1)).float().sum().item()
@@ -197,44 +212,181 @@ def fprf(y_true, y_pred, threshold=0.5):
     tn = ((y_pred < threshold) & (y_true == 0)).float().sum().item()
     return fp / (fp + tn) if (fp + tn) > 0 else -1
 
-# Training and evaluation loop
-num_epochs = 5
-for epoch in range(num_epochs):
-    model.train()
-    for images, masks in dataloader:
-        images, masks = images.to(device), masks.to(device)
-        print("hi")
-        outputs = model(images)
-        preds = (outputs > 0.5).float()
-        loss = criterion(outputs, masks)
+loss_data = []
+dice_data = []
+fpr_data = []
+tpr_data = []
+
+def to_device(x):
+    if torch.cuda.is_available():
+        return x.cuda()
+    else:
+        return x.cpu()
+    
+from datetime import datetime
+
+
+def train_model(model, loader, optimizer):
+    to_device(model.train())
+    criterion = nn.BCELoss()
+
+    running_loss = 0.0
+    running_Dice = 0.0
+    running_fprf = 0.0
+    running_tprf = 0.0
+    running_samples = 0
+    batch_idx = 0
+    
+    for inputs, targets in loader:
+        batch_idx = batch_idx + 1
         optimizer.zero_grad()
+        inputs = to_device(inputs)
+        targets = to_device(targets)
+
+        outputs = model(inputs)
+        outputs = outputs.squeeze(dim=1)
+
+        outputs = outputs.to(torch.float)
+
+        targets = targets.squeeze(dim=1)
+        loss = criterion(outputs, targets)
+        
+        TPR = tprf(outputs, targets)
+        FPR = fprf(outputs,targets)
+        Dice = dice_coef(outputs, targets)
         loss.backward()
         optimizer.step()
-        print("train")
-    #TPRs = []
-    #FPRs = []
-    model.eval()
-    with torch.no_grad():
-        dice_scores = []
-        for images, masks in dataloader:
-            images = images.to(device)
-            masks = masks.to(device)
-            outputs = model(images)
-            preds = (outputs > 0.5).float()
-            dice_scores.append(dice_coef(preds, masks).item())
+    
+        running_samples += targets.size(0)
+        running_loss += loss.item()
+        running_Dice += Dice.item()
+        running_fprf += FPR
+        running_tprf += TPR
 
-    # Calculate average scores
-    avg_dice = np.mean(dice_scores)
-    #avg_tpr = np.mean(TPRs)
-    #avg_fpr = np.mean(FPRs)
-    print(f'Average Dice: {avg_dice:.4f}')
-          
- #TPR: {avg_tpr:.4f}, FPR: {avg_fpr:.4f}'
+    fpr_data.append(running_fprf / (batch_idx)) 
+    tpr_data.append(running_tprf / (batch_idx))   
+    loss_data.append(running_loss / (batch_idx))
+    dice_data.append(running_Dice / (batch_idx))
 
-    with open(output_path, "a") as f:
-        print(f'Epoch {epoch + 1} Results:', file=f)
-        print(f'Average Dice Score: {avg_dice:.4f}', file=f)
-        #print(f'Average TPR: {avg_tpr:.4f}', file=f)
-        #print(f'Average FPR: {avg_fpr:.4f}', file=f)
+    print("Trained {} samples, Loss: {:.4f}, DiceCoef: {:.4f}, FPR: {:.4f}, TPR: {:.4f}".format(
+        running_samples,
+        running_loss / (batch_idx),
+        running_Dice / (batch_idx),
+        running_fprf / (batch_idx),
+        running_tprf / (batch_idx)
+    ))
 
-print("Training complete.")
+
+def prediction_accuracy(ground_truth_labels, predicted_labels):
+    eq = ground_truth_labels == predicted_labels
+    return eq.sum().item() / predicted_labels.numel()
+    
+
+to_device(model)
+optimizer = torch.optim.Adam(model.parameters(), lr=5e-4)
+scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=12, gamma=0.8)
+
+def train_loop(model, loader, test_data, epochs, optimizer, scheduler):
+
+    epoch_i, epoch_j = epochs
+    for i in range(epoch_i, epoch_j):
+        epoch = i
+        print(f"Epoch: {i:02d}, Learning Rate: {optimizer.param_groups[0]['lr']}")
+        current_time = datetime.now()
+        print("Current time:", current_time.strftime("%H:%M:%S"))
+        train_model(model, loader, optimizer)
+        torch.save(model.state_dict(), "/Users/emilyyip/Desktop/MRI/preds/model.pth")
+
+        if scheduler is not None:
+            scheduler.step()
+
+        print("")
+
+empty=[]
+
+
+pred_dice = []
+file_num = 0
+
+for fold, (train_idx, val_idx) in enumerate(kf.split(dataset)):
+        print(f"Training fold {fold+1}/{kf.n_splits}")
+
+        train_subset = Subset(dataset, train_idx)
+        val_subset = Subset(dataset, val_idx)
+
+        train_loader = DataLoader(train_subset, batch_size=1, shuffle=True)
+        val_loader = DataLoader(val_subset, batch_size=1, shuffle=False)
+
+        train_loop(model, train_loader, empty, (1, 10), optimizer, scheduler)
+
+        plt.figure(figsize=(15,5))
+        plt.subplot(1,2,1)
+        plt.plot(loss_data, color='r')
+        plt.ylabel('Losses')
+        plt.xlabel('Epoch')
+        plt.legend(['Train'], loc='upper right')
+        plt.subplot(1,2,2)
+        plt.plot(dice_data, color='r')
+        plt.ylabel('dice_coef')
+        plt.xlabel('Epoch')
+        plt.tight_layout()
+        plt.savefig(f'/Users/emilyyip/Desktop/MRI/preds/process.png')
+        plt.close()
+
+        model.load_state_dict(torch.load("/Users/emilyyip/Desktop/MRI/preds/model.pth"))
+        to_device(model.eval())
+
+
+        pred_dice = []
+        file_num = 0
+
+        # use test loader here, add fpr and tpr
+        for inputs, targets in test_loader:
+            inputs = to_device(inputs)
+            targets = to_device(targets)
+
+            outputs = model(inputs)
+            outputs = outputs.to(torch.float)
+            test_img = inputs.squeeze(dim=1)
+            test_mask = targets.squeeze(dim=1)
+            pred_mask = outputs.squeeze(dim=1)
+
+            test_img = test_img.cpu().detach().numpy()
+            test_mask = test_mask.cpu().detach().numpy()
+            pred_mask = pred_mask.cpu().detach().numpy()
+
+            Dice = dice_coef(outputs, targets)
+            
+            pred_dice.append(Dice.item())
+
+            for batch in range(batch_size):
+                for slice in range(0,40,10):
+                            plt.figure(figsize=(15, 10))
+                            plt.subplot(1, 3, 1)
+                            plt.imshow(test_img[batch,:,:,slice], cmap='binary')
+                            plt.title('Original Image')
+                            plt.axis('off')
+                            plt.subplot(1, 3, 2)
+                            plt.imshow(test_mask[batch,:,:,slice], cmap='binary')
+                            plt.title('Ground Truth')
+                            plt.axis('off')
+                            plt.subplot(1, 3, 3)
+                            plt.imshow(pred_mask[batch,:,:,slice], cmap='binary')
+                            plt.title('Prediction')
+                            plt.axis('off')
+                            plt.savefig(f'/Users/emilyyip/Desktop/MRI/preds/images/img{file_num}_slice{slice}.png')
+                            plt.close()
+                            file_num += 1
+                            train = np.array(dice_data)
+                            test = np.array(pred_dice)
+                            test_dice = np.mean(test)
+
+                            f = open("/Users/emilyyip/Desktop/MRI/preds/output.txt", "a")
+                            print('Best training dice score:', file=f)
+                            print(np.max(train), file=f)
+                            print('Average prediction dice score:', file=f)
+                            print(test_dice, file=f)
+                            f.close()
+                            print('Average prediction dice score:')
+                            print(test_dice)
+
